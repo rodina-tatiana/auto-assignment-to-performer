@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 TRACKER_TOKEN = os.environ["TRACKER_TOKEN"]
 ORG_ID = os.environ["TRACKER_ORG_ID"]
 ORG_HEADER = os.getenv("TRACKER_ORG_HEADER", "X-Org-ID")  # or "X-Cloud-Org-ID"
-TRACKER_QUEUE = os.getenv("TRACKER_QUEUE", "PM")          # queue to take teamUsers from
+TRACKER_QUEUE = os.getenv("TRACKER_QUEUE", "PM")
 STATUS_TYPES = [x.strip() for x in os.getenv("STATUS_TYPES", "").split(",") if x.strip()]
 DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "True", "yes", "on")
 
@@ -24,7 +24,8 @@ HEADERS = {
 
 
 def log(message: str):
-    print(message, flush=True)
+    # В Cloud Logging время и так отображается отдельно — печатаем только сообщение
+    print(message, file=sys.stderr, flush=True)
 
 
 def log_debug(message: str, **fields):
@@ -34,7 +35,7 @@ def log_debug(message: str, **fields):
     line = f"[DEBUG {ts}] {message}"
     if fields:
         line += " | " + json.dumps(fields, ensure_ascii=False)
-    print(line, flush=True)
+    print(line, file=sys.stderr, flush=True)
 
 
 def _resp(status: int, body: dict):
@@ -50,17 +51,14 @@ def _parse_body(event: dict) -> dict:
     body = event.get("body")
     if body is None:
         return {}
-
     if isinstance(body, dict):
         return body
-
     if isinstance(body, str):
         raw = body
         if event.get("isBase64Encoded"):
             raw = base64.b64decode(body).decode("utf-8", errors="replace")
         raw = raw.strip()
         return json.loads(raw) if raw else {}
-
     return {}
 
 
@@ -71,7 +69,6 @@ def get_queue_team_user_ids(queue_key: str) -> list[str]:
 
     team_users = data.get("teamUsers") or []
     ids: list[str] = []
-
     for u in team_users:
         if not isinstance(u, dict):
             continue
@@ -107,7 +104,11 @@ def _get_total_count_header(r: requests.Response) -> str | None:
     return r.headers.get("X-Total-Count") or r.headers.get("x-total-count")
 
 
-def count_issues_for_assignee_via_search(user_id: str) -> int:
+def count_issues_for_assignee_via_search(user_id: str) -> tuple[int, str | None]:
+    """
+    Возвращает (count, display).
+    display берём из assignee.display первой найденной задачи (perPage=1).
+    """
     query = build_search_query(user_id)
 
     url = f"{BASE}/v2/issues/_search"
@@ -115,12 +116,7 @@ def count_issues_for_assignee_via_search(user_id: str) -> int:
     payload = {"query": query}
 
     r = requests.post(url, headers=HEADERS, params=params, json=payload, timeout=30)
-
-    log_debug("SEARCH result", userId=user_id, status=r.status_code, query=query)
-
-    if DEBUG:
-        log_debug("SEARCH headers full", headers=dict(r.headers))
-        log_debug("SEARCH body preview", body_preview=r.text[:5000])
+    log_debug("SEARCH", userId=user_id, status=r.status_code, x_total_count=_get_total_count_header(r), query=query)
 
     r.raise_for_status()
 
@@ -128,7 +124,19 @@ def count_issues_for_assignee_via_search(user_id: str) -> int:
     if total is None:
         raise RuntimeError("X-Total-Count header is missing in Tracker response")
 
-    return int(total)
+    count = int(total)
+
+    display = None
+    try:
+        issues = r.json()
+        if isinstance(issues, list) and issues:
+            assignee = issues[0].get("assignee") or {}
+            if isinstance(assignee, dict):
+                display = assignee.get("display")
+    except Exception:
+        display = None
+
+    return count, display
 
 
 def set_issue_assignee(issue_key: str, user_id: str) -> None:
@@ -145,38 +153,48 @@ def handler(event, context):
             log("Ошибка: в запросе не передан ключ задачи (issueKey)")
             return _resp(400, {"error": "issueKey (or key) is required"})
 
-        loads: list[tuple[int, str]] = []
-        for uid in get_queue_team_user_ids(TRACKER_QUEUE):
-            cnt = count_issues_for_assignee_via_search(uid)
-            loads.append((cnt, uid))
+        log(f"Функция отработала для задачи {issue_key}")
 
-        if not loads:
+        team_ids = get_queue_team_user_ids(TRACKER_QUEUE)
+        if not team_ids:
             log(f"Ошибка: в очереди {TRACKER_QUEUE} не найдено ни одного участника команды")
             return _resp(500, {"error": "No teamUsers with ids found", "queue": TRACKER_QUEUE})
 
-        loads.sort(key=lambda x: x[0])
-        least_count, least_uid = loads[0]
+        loads: list[tuple[int, str, str | None]] = []  # (count, id, display)
+        for uid in team_ids:
+            cnt, display = count_issues_for_assignee_via_search(uid)
+            loads.append((cnt, uid, display))
 
+        # выбираем наименее загруженного
+        loads.sort(key=lambda x: x[0])
+        least_count, least_uid, least_display = loads[0]
+
+        # лог по каждому пользователю — один раз
+        for cnt, uid, display in loads:
+            marker = " ← выбран" if uid == least_uid else ""
+            log(f"У пользователя {display or 'Без имени'} (id: {uid}) — {cnt} задач{marker}")
+
+        # назначаем
         set_issue_assignee(issue_key, least_uid)
 
-        log(f"\nЗадача \"{issue_key}\" назначена пользователю {least_uid}")
-        log(f"\nСтатистика по загрузке:")
-        for cnt, uid in loads:
-            marker = " ←" if uid == least_uid else ""
-            log(f"  Пользователь {uid} — {cnt} задач{marker}")
+        # финальная строка как вы просили: id + count внутри скобок
+        log(
+            f'Задача "{issue_key}" назначена пользователю {least_display or "Без имени"} '
+            f'(id: {least_uid} - {least_count} задач)'
+        )
 
-        all_loads = [{"userId": uid, "count": c} for c, uid in loads]
         return _resp(200, {
             "issueKey": issue_key,
             "assignedTo": {"id": least_uid},
             "leastLoad": least_count,
-            "allLoads": all_loads,
+            "allLoads": [{"userId": uid, "count": cnt, "display": (display or None)} for cnt, uid, display in loads],
         })
 
     except requests.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else "unknown"
         log(f"Ошибка Tracker API: статус {status_code}")
-        log_debug("Tracker API error detail", details=str(e))
+        if DEBUG and e.response is not None:
+            log_debug("Tracker API error body", body=e.response.text)
         return _resp(502, {"error": "Tracker API error", "status_code": status_code})
 
     except Exception as e:
